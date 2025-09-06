@@ -8,170 +8,138 @@ suitable for display in the application. It includes caching and robust error ha
 import requests
 import pandas as pd
 import time
+from collections import defaultdict
 
 # --- Constants ---
 BASE_URL = "https://draft.premierleague.com/api"
 BOOTSTRAP_URL = f"{BASE_URL}/bootstrap-static"
 LEAGUE_URL_TEMPLATE = f"{BASE_URL}/league/{{league_id}}/details"
-DRAFT_CHOICES_URL_TEMPLATE = f"{BASE_URL}/draft/{{league_id}}/choices"
-LIVE_EVENT_URL_TEMPLATE = f"{BASE_URL}/event/{{gameweek}}/live"
+ELEMENT_STATUS_URL_TEMPLATE = f"{BASE_URL}/league/{{league_id}}/element-status"
 
 # --- In-Memory Cache ---
-# A simple dictionary to cache results from the API to avoid redundant calls.
 DATA_CACHE = {}
-CACHE_DURATION_SECONDS = 600  # 10 minutes
+CACHE_DURATION_SECONDS = 600
 
 def _get_json_from_url(url: str):
-    """
-    Safely gets JSON from a URL, handling network errors, bad status codes,
-    and non-JSON responses. Returns None on failure.
-    """
+    """Safely gets JSON from a URL."""
     try:
-        print(f"[data_fetcher] Fetching URL: {url}")
         response = requests.get(url)
-        response.raise_for_status()  # Raises an HTTPError for bad responses (4xx or 5xx)
+        response.raise_for_status()
         return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"[data_fetcher] ERROR: Network error fetching {url}: {e}")
+    except (requests.exceptions.RequestException, requests.exceptions.JSONDecodeError) as e:
+        print(f"[data_fetcher] ERROR: Failed to fetch or decode {url}: {e}")
         return None
-    except requests.exceptions.JSONDecodeError:
-        print(f"[data_fetcher] ERROR: Failed to decode JSON from {url}. Response text: {response.text}")
-        return None
+
+def _calculate_rank(diff):
+    """Calculates a 1-10 rank based on performance vs. expectation."""
+    if diff >= 8: return 10
+    if diff >= 4: return 8
+    if diff >= 2: return 7
+    if diff >= 0: return 6
+    if diff > -2: return 5
+    return 1
+
+def _calculate_team_form_difficulty(bootstrap_data):
+    """Calculates a dynamic difficulty score based on the last 5 results of opponents."""
+    print("[data_fetcher] Calculating dynamic team form difficulty...")
+    fixtures = bootstrap_data.get('fixtures', [])
+    if not fixtures: return None
+
+    team_results = defaultdict(list)
+    finished_fixtures = [f for f in fixtures if isinstance(f, dict) and f.get('finished')]
+    for fix in sorted(finished_fixtures, key=lambda x: x.get('event', 0)):
+        team_h_score, team_a_score = fix.get('team_h_score'), fix.get('team_a_score')
+        if team_h_score is not None and team_a_score is not None:
+            if team_h_score > team_a_score: team_results[fix['team_h']].append('W'); team_results[fix['team_a']].append('L')
+            elif team_a_score > team_h_score: team_results[fix['team_a']].append('W'); team_results[fix['team_h']].append('L')
+            else: team_results[fix['team_h']].append('D'); team_results[fix['team_a']].append('D')
+
+    form_scores = {team_id: sum([3 if r == 'W' else 1 if r == 'D' else 0 for r in results[-5:]]) for team_id, results in team_results.items()}
+    if not form_scores: return None
+    
+    min_score, max_score = min(form_scores.values()), max(form_scores.values())
+    
+    team_form_difficulty = {}
+    for team_id, score in form_scores.items():
+        if max_score == min_score: normalized_score = 3.0
+        else: normalized_score = 1 + 4 * (score - min_score) / (max_score - min_score)
+        team_form_difficulty[team_id] = normalized_score
+        
+    return pd.DataFrame(list(team_form_difficulty.items()), columns=['id', 'Form Difficulty'])
+
+def _process_fixtures(bootstrap_data, teams_df):
+    """Processes fixtures to calculate a blended average difficulty."""
+    print("[data_fetcher] Processing fixture data...")
+    fixtures = bootstrap_data.get('fixtures')
+    if not fixtures: return None
+
+    try:
+        current_gw = next(event['id'] for event in bootstrap_data.get('events', []) if isinstance(event, dict) and event.get('is_current'))
+    except StopIteration: current_gw = 1
+
+    form_difficulty_df = _calculate_team_form_difficulty(bootstrap_data)
+    form_map = form_difficulty_df.set_index('id')['Form Difficulty'].to_dict() if form_difficulty_df is not None else {}
+    
+    team_fixtures = defaultdict(list)
+    for fix in fixtures:
+        if isinstance(fix, dict) and fix.get('event') and fix['event'] >= current_gw:
+            team_fixtures[fix['team_h']].append({'opp_id': fix['team_a'], 'fpl_diff': fix['team_h_difficulty']})
+            team_fixtures[fix['team_a']].append({'opp_id': fix['team_h'], 'fpl_diff': fix['team_a_difficulty']})
+
+    team_avg_difficulty = {}
+    for team_id, future_games in team_fixtures.items():
+        difficulties = []
+        for game in future_games[:3]:
+            fpl_diff = game['fpl_diff']
+            form_diff = form_map.get(game['opp_id'], 3.0) # Use the map for a safe lookup
+            combined_diff = (fpl_diff * 0.6) + (form_diff * 0.4)
+            difficulties.append(combined_diff)
+        if difficulties: team_avg_difficulty[team_id] = sum(difficulties) / len(difficulties)
+
+    difficulty_df = pd.DataFrame(list(team_avg_difficulty.items()), columns=['id', 'Avg Difficulty'])
+    teams_with_difficulty = teams_df.merge(difficulty_df, on='id', how='left')
+    teams_with_difficulty['Avg Difficulty'] = teams_with_difficulty['Avg Difficulty'].fillna(3.0)
+    
+    return teams_with_difficulty[['id', 'Avg Difficulty']]
 
 def fetch_fpl_data(league_id: int, force_refresh: bool = False):
-    """
-    Orchestrates the entire data fetching and processing pipeline.
-    1. Checks cache.
-    2. Fetches data from multiple API endpoints.
-    3. Cleans and merges the data into a master player DataFrame.
-    4. Segregates players into drafted and undrafted tables.
-    """
-    # --- Cache Check ---
     current_time = time.time()
-    print("[data_fetcher] Starting data fetch process...")
     if not force_refresh and league_id in DATA_CACHE and (current_time - DATA_CACHE[league_id]['timestamp'] < CACHE_DURATION_SECONDS):
-        print(f"[data_fetcher] Cache hit for league {league_id}. Returning cached data.")
         return DATA_CACHE[league_id]['data']
-    print(f"[data_fetcher] Cache miss or refresh forced for league {league_id}.")
 
-    # ====== 1. Fetch Core Data ======
-    print("[data_fetcher] Fetching core bootstrap and league data...")
     bootstrap = _get_json_from_url(BOOTSTRAP_URL)
-    if not bootstrap or 'elements' not in bootstrap:
-        print("Critical error: Failed to fetch or validate bootstrap data.")
-        return None, None, None
+    if not bootstrap or 'elements' not in bootstrap: return None, None, None
 
-    # --- Validate Bootstrap Data Structure ---
-    # Ensures that the core data structures from the bootstrap endpoint are lists before creating DataFrames.
-    # This prevents TypeErrors if the API returns unexpected data types.
-    for key in ['elements', 'teams', 'element_types']:
-        if not isinstance(bootstrap.get(key), list):
-            print(f"Critical error: Bootstrap data for '{key}' is not a list as expected.")
-            return None, None, None
-
-    players_df = pd.DataFrame(bootstrap['elements'])
-    teams_df = pd.DataFrame(bootstrap['teams'])
-    positions_df = pd.DataFrame(bootstrap['element_types'])
-    print("[data_fetcher] Core DataFrames created.")
-
-    league_url = LEAGUE_URL_TEMPLATE.format(league_id=league_id)
-    league_data = _get_json_from_url(league_url)
-    if not league_data or 'league_entries' not in league_data:
-        print(f"Critical error: Failed to fetch or validate league data for league {league_id}.")
-        return None, None, None
+    players_df, teams_df, pos_df = pd.DataFrame(bootstrap['elements']), pd.DataFrame(bootstrap['teams']), pd.DataFrame(bootstrap['element_types'])
+    league_data = _get_json_from_url(LEAGUE_URL_TEMPLATE.format(league_id=league_id))
+    if not league_data: return None, None, None
     
-    # ====== 2. Process and Enrich Data ======
-    print("[data_fetcher] Enriching player data with team, position, and owner info...")
-    # Enrich player data with team names and positions.
-    players_df = players_df.merge(
-        teams_df[['id', 'name']], left_on='team', right_on='id', how='left', suffixes=('', '_team')
-    ).rename(columns={'name': 'team_name'}).drop(columns=['id_team'])
+    difficulty_df = _process_fixtures(bootstrap, teams_df)
+    if difficulty_df is not None: teams_df = teams_df.merge(difficulty_df, on='id', how='left')
+    if 'Avg Difficulty' not in teams_df.columns: teams_df['Avg Difficulty'] = 3.0
 
-    players_df = players_df.merge(
-        positions_df[['id', 'singular_name']], left_on='element_type', right_on='id', how='left', suffixes=('', '_pos')
-    ).rename(columns={'singular_name': 'position'}).drop(columns=['id_pos'])
-
-    # Create a mapping of league entry IDs to team names.
-    # A for-loop is used for robustness, preventing TypeErrors if the API returns non-dictionary items.
-    entry_id_to_name = {}
-    for entry in league_data.get('league_entries', []):
-        if isinstance(entry, dict) and 'entry_id' in entry and 'entry_name' in entry:
-            entry_id_to_name[entry['entry_id']] = entry['entry_name']
-
-    # Map each drafted player to their owner's team name.
-    draft_picks_url = DRAFT_CHOICES_URL_TEMPLATE.format(league_id=league_id)
-    draft_picks_data = _get_json_from_url(draft_picks_url)
-
-    player_to_team = {}
-    if draft_picks_data and isinstance(draft_picks_data.get('choices'), list):
-        for pick in draft_picks_data['choices']:
-            if isinstance(pick, dict):
-                player_id = pick.get('element')
-                entry_id = pick.get('entry')
-                if player_id and entry_id and entry_id in entry_id_to_name:
-                    player_to_team[player_id] = entry_id_to_name[entry_id]
+    players_df = players_df.merge(teams_df[['id', 'name', 'Avg Difficulty']], left_on='team', right_on='id', how='left', suffixes=('', '_team')).rename(columns={'name': 'team_name'}).drop(columns=['id_team'])
+    players_df = players_df.merge(pos_df[['id', 'singular_name']], left_on='element_type', right_on='id', how='left', suffixes=('', '_pos')).rename(columns={'singular_name': 'position'}).drop(columns=['id_pos'])
     
+    players_df.rename(columns={'ep_next': 'Expected Points Next', 'ep_this': 'Expected Points Prev GW', 'event_points': 'Points Prev GW'}, inplace=True)
+    
+    for col in ['points_per_game', 'Expected Points Next', 'Expected Points Prev GW', 'Points Prev GW', 'form', 'Avg Difficulty']:
+        if col in players_df.columns: players_df[col] = pd.to_numeric(players_df[col], errors='coerce').fillna(0)
+    
+    players_df['EP Diff'] = players_df['Points Prev GW'] - players_df['Expected Points Prev GW']
+    players_df['Rank'] = players_df['EP Diff'].apply(_calculate_rank)
+
+    entry_id_to_name = {e['entry_id']: e['entry_name'] for e in league_data.get('league_entries', []) if isinstance(e, dict)}
+    status_url = ELEMENT_STATUS_URL_TEMPLATE.format(league_id=league_id)
+    status_data = _get_json_from_url(status_url)
+    
+    player_to_team = {s['element']: entry_id_to_name.get(s['owner']) for s in (status_data or {}).get('element_status', []) if isinstance(s, dict) and s.get('owner')}
     players_df['owner'] = players_df['id'].map(player_to_team)
-    print("[data_fetcher] Player data enrichment complete.")
-
-    # ====== 3. Fetch Recent Gameweek Stats for Cumulative Totals ======
-    print("[data_fetcher] Fetching recent gameweek stats...")
-    # This is done robustly to handle cases where 'events' contains non-dictionary items.
-    current_gw_data = next((event for event in bootstrap.get('events', [])
-                            if isinstance(event, dict) and event.get('is_current')),
-                           None)
-    current_gw = current_gw_data['id'] if current_gw_data else 1
-    gameweeks_to_fetch = list(range(max(1, current_gw - 3), current_gw + 1))
-
-    gameweek_stats_list = []
-    # Fetch live data for the last few gameweeks to calculate cumulative stats.
-    for gameweek in gameweeks_to_fetch:
-        gameweek_url = LIVE_EVENT_URL_TEMPLATE.format(gameweek=gameweek)
-        gameweek_live_data = _get_json_from_url(gameweek_url)
-        
-        if gameweek_live_data and isinstance(gameweek_live_data.get('elements'), dict):
-            for player_id, player_data in gameweek_live_data['elements'].items():
-                stats = player_data.get('stats', {})
-                stats['id'] = int(player_id)
-                stats['gameweek'] = gameweek
-                gameweek_stats_list.append(stats)
-
-    if not gameweek_stats_list:
-        gameweek_stats_df = pd.DataFrame(columns=['id', 'gameweek'])
-    else:
-        gameweek_stats_df = pd.DataFrame(gameweek_stats_list)
-    print(f"[data_fetcher] Found {len(gameweek_stats_list)} gameweek stat entries.")
-
-    merged_df = players_df.merge(gameweek_stats_df, on='id', how='left', suffixes=('', '_gw_stats'))
-    print("[data_fetcher] Calculating cumulative points...")
     
-    # --- Calculate Cumulative Points (Robustly) ---
-    # An explicit check for the column's existence is used for robustness.
-    if 'total_points_gw_stats' in merged_df.columns:
-        merged_df['total_points_gw_stats'] = pd.to_numeric(merged_df['total_points_gw_stats'], errors='coerce')
-        cumulative_points_df = merged_df.groupby('id')['total_points_gw_stats'].sum().reset_index()
-        cumulative_points_df.rename(columns={'total_points_gw_stats': 'cumulative_total_points'}, inplace=True)
-    else:
-        # If no gameweek data was found, create a cumulative points column initialized to zero.
-        cumulative_points_df = players_df[['id']].copy()
-        cumulative_points_df['cumulative_total_points'] = 0
+    teams_tables = {t: players_df[players_df['owner'] == t].copy().sort_values('total_points', ascending=False) for t in set(player_to_team.values()) if t}
+    undrafted = players_df[players_df['owner'].isna()].copy().sort_values('total_points', ascending=False)
 
-    players_df = players_df.merge(cumulative_points_df, on='id', how='left')
-    players_df['cumulative_total_points'] = players_df['cumulative_total_points'].fillna(0).astype(int)
-    print("[data_fetcher] Cumulative points calculation complete.")
-    
-    # ====== 4. Create Final Output Tables ======
-    print("[data_fetcher] Segregating players into drafted and undrafted tables...")
-    teams_tables = {
-        team: players_df[players_df['owner'] == team].copy().sort_values('cumulative_total_points', ascending=False).reset_index(drop=True)
-        for team in set(players_df['owner'].dropna().unique())
-    }
-    undrafted_table = players_df[players_df['owner'].isna()].copy().sort_values('cumulative_total_points', ascending=False).reset_index(drop=True)
-
-    # ====== 5. Cache the Result ======
-    print("[data_fetcher] Caching new data...")
-    result = (players_df, teams_tables, undrafted_table)
+    result = (players_df, teams_tables, undrafted)
     DATA_CACHE[league_id] = {'timestamp': current_time, 'data': result}
     
-    print("[data_fetcher] Data fetch process finished successfully.")
     return result
